@@ -444,7 +444,7 @@ the current value of :confval:`bluestore_min_alloc_size_hdd`; but with SSD OSDs
 :confval:`bluestore_min_alloc_size_ssd`.
 
 In Mimic and earlier releases, the default values were 64KB for rotational
-media (HDD) and 16KB for non-rotational media (SSD). The Octopus release
+media (HDD) and 16KB for non-rotational media (SSD). The Nautilus 14.2.8 release
 changed the the default value for non-rotational media (SSD) to 4KB, and the
 Pacific release changed the default value for rotational media (HDD) to 4KB.
 
