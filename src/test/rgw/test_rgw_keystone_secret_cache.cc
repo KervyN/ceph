@@ -291,6 +291,7 @@ class SecretCacheTest : public ::testing::Test {
     set_conf("rgw_keystone_token_cache_refresh_enabled", "false");
     set_conf("rgw_keystone_token_cache_refresh_before", "30");
     set_conf("rgw_keystone_token_cache_refresh_max_concurrent", "16");
+    set_conf("rgw_keystone_token_cache_ttl_jitter", "0");
   }
 
   /* the cache snapshots size and ttl in its constructor */
@@ -1299,6 +1300,44 @@ TEST_F(SecretCacheTest, RefreshFetchExceptionsCountAsFailures)
     EXPECT_EQ(++n, counter(l_rgw_keystone_secret_cache_refresh_failed));
     EXPECT_EQ(0u, cache->refreshes_in_flight());
     EXPECT_EQ(1u, cache->size());
+  }
+}
+
+/* ---- ttl jitter ----------------------------------------------------------- */
+
+TEST_F(SecretCacheTest, JitterShortensLifetimeWithinBounds)
+{
+  set_conf("rgw_keystone_token_cache_ttl_jitter", "60");
+  const int n = 300;
+  for (int i = 0; i < n; ++i) {
+    cache->add("k" + std::to_string(i), make_token(), "s");
+  }
+  auto present = [&] {
+    int count = 0;
+    for (int i = 0; i < n; ++i) {
+      count += bool(cache->find("k" + std::to_string(i)));
+    }
+    return count;
+  };
+  advance_clock(240);
+  EXPECT_EQ(n, present());            // lifetime is at least ttl - jitter
+  advance_clock(30);
+  const int halfway = present();      // 270 s: the jitter spreads the expiries
+  EXPECT_GT(halfway, 0);
+  EXPECT_LT(halfway, n);
+  advance_clock(31);
+  EXPECT_EQ(0, present());            // and never lengthens them
+}
+
+TEST_F(SecretCacheTest, JitterIsClampedToHalfTtl)
+{
+  set_conf("rgw_keystone_token_cache_ttl_jitter", "1000");
+  for (int i = 0; i < 100; ++i) {
+    cache->add("k" + std::to_string(i), make_token(), "s");
+  }
+  advance_clock(150);
+  for (int i = 0; i < 100; ++i) {
+    EXPECT_TRUE(cache->find("k" + std::to_string(i)));
   }
 }
 

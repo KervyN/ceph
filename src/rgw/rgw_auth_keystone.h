@@ -268,6 +268,10 @@ private:
                            const std::string& secret, uint64_t gen);
   /* rgw_keystone_token_cache_refresh_before, clamped to [1, ttl/2] */
   uint32_t refresh_before_secs() const;
+  /* random 0..rgw_keystone_token_cache_ttl_jitter seconds, at most ttl/2 */
+  utime_t jitter() const;
+  /* expiry of an entry cached now: ttl minus jitter; computed outside the lock */
+  utime_t new_expiry() const;
 
   /* Join the flight for access_key_id, or start one. Checks the cache
    * again first: a caller that finds the key cached since its lookup()

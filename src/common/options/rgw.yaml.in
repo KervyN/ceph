@@ -1104,6 +1104,25 @@ options:
   see_also:
   - rgw_keystone_token_cache_refresh_enabled
   with_legacy: true
+- name: rgw_keystone_token_cache_ttl_jitter
+  type: uint
+  level: advanced
+  desc: Maximum random shortening (seconds) of a cached Keystone S3 credential's lifetime
+  long_desc: The lifetime of each entry in the Keystone S3 credential cache is
+    ``rgw_keystone_token_cache_ttl`` minus a random 0 to
+    ``rgw_keystone_token_cache_ttl_jitter`` seconds, so that credentials cached
+    at the same moment, or the same credential on several gateways, do not
+    expire (and refresh) in the same second. Never lengthens the lifetime.
+    Values above half of ``rgw_keystone_token_cache_ttl`` are clamped to that.
+    About a tenth of the TTL is a reasonable value when
+    ``rgw_keystone_token_cache_refresh_enabled`` is set.
+  default: 0
+  services:
+  - rgw
+  see_also:
+  - rgw_keystone_token_cache_ttl
+  - rgw_keystone_token_cache_refresh_enabled
+  with_legacy: true
 - name: rgw_keystone_verify_ssl
   type: bool
   level: advanced

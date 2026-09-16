@@ -15,6 +15,7 @@
 
 #include "common/errno.h"
 #include "common/ceph_json.h"
+#include "include/random.h"
 #include "include/types.h"
 #include "include/str_list.h"
 
@@ -809,6 +810,17 @@ uint32_t SecretCache::refresh_before_secs() const
   return std::max<uint64_t>(clamped, 1);  // also the background call timeout
 }
 
+utime_t SecretCache::jitter() const
+{
+  const uint64_t max_jitter = std::min<uint64_t>(
+      cct->_conf->rgw_keystone_token_cache_ttl_jitter,
+      s3_token_expiry_length.sec() / 2);
+  if (max_jitter == 0) {
+    return utime_t();
+  }
+  return utime_t(ceph::util::generate_random_number<uint64_t>(0, max_jitter), 0);
+}
+
 SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id,
                                                const bool want_refresh)
 {
@@ -871,11 +883,18 @@ bool SecretCache::find(const std::string& token_id,
   return true;
 }
 
+utime_t SecretCache::new_expiry() const
+{
+  /* shortened by a random jitter so that entries cached together do not
+   * expire together; never lengthened, the ttl stays a hard bound */
+  return now_fn() + s3_token_expiry_length - jitter();
+}
+
 void SecretCache::add(const std::string& token_id,
                       const SecretCache::token_envelope_t& token,
 		      const std::string& secret)
 {
-  const utime_t expires = now_fn() + s3_token_expiry_length;
+  const utime_t expires = new_expiry();
   std::lock_guard<std::mutex> l(lock);
   add_locked(token_id, token, secret, expires);
 }
@@ -885,7 +904,7 @@ bool SecretCache::add_unless_replaced(const std::string& token_id,
                                       const std::string& secret,
                                       const uint64_t gen)
 {
-  const utime_t expires = now_fn() + s3_token_expiry_length;
+  const utime_t expires = new_expiry();
   std::lock_guard<std::mutex> l(lock);
   auto iter = secrets.find(token_id);
   if (iter != secrets.end() && iter->second.gen != gen) {
