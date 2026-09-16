@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fnmatch.h>
 
+#include <boost/context/detail/exception.hpp>
+
 #include "rgw_b64.h"
 
 #include "common/errno.h"
@@ -409,14 +411,22 @@ TokenEngine::authenticate(const DoutPrefixProvider* dpp,
 }
 
 
+static void set_timeout(RGWHTTPClient& client, const long timeout_secs)
+{
+  if (timeout_secs > 0) {
+    client.set_req_timeout(timeout_secs);
+    client.set_req_connect_timeout(timeout_secs);
+  }
+}
+
 /*
  * Try to validate S3 auth against keystone s3token interface
  */
 std::pair<boost::optional<rgw::keystone::TokenEnvelope>, int>
-EC2Engine::get_from_keystone(const DoutPrefixProvider* dpp, const std::string_view& access_key_id,
-                             const std::string& string_to_sign,
-                             const std::string_view& signature,
-                             optional_yield y) const
+CredentialFetcher::get_token(const DoutPrefixProvider* dpp,
+                             const SignedSample& sample,
+                             optional_yield y,
+                             const long timeout_secs) const
 {
   /* prepare keystone url */
   std::string keystone_url = config.get_endpoint_url();
@@ -451,14 +461,15 @@ EC2Engine::get_from_keystone(const DoutPrefixProvider* dpp, const std::string_vi
 
   /* check if we want to verify keystone's ssl certs */
   validate.set_verify_ssl(cct->_conf->rgw_keystone_verify_ssl);
+  set_timeout(validate, timeout_secs);
 
   /* create json credentials request body */
   JSONFormatter credentials(false);
   credentials.open_object_section("");
   credentials.open_object_section("credentials");
-  credentials.dump_string("access", sview2cstr(access_key_id).data());
-  credentials.dump_string("token", rgw::to_base64(string_to_sign));
-  credentials.dump_string("signature", sview2cstr(signature).data());
+  credentials.dump_string("access", sample.access_key_id);
+  credentials.dump_string("token", rgw::to_base64(sample.string_to_sign));
+  credentials.dump_string("signature", sample.signature);
   credentials.close_section();
   credentials.close_section();
 
@@ -497,10 +508,11 @@ EC2Engine::get_from_keystone(const DoutPrefixProvider* dpp, const std::string_vi
   return std::make_pair(std::move(token_envelope), 0);
 }
 
-auto EC2Engine::get_secret_from_keystone(const DoutPrefixProvider* dpp,
-                                         const std::string& user_id,
-                                         const std::string_view& access_key_id,
-                                         optional_yield y) const
+auto CredentialFetcher::get_secret(const DoutPrefixProvider* dpp,
+                                   const std::string_view user_id,
+                                   const std::string_view access_key_id,
+                                   optional_yield y,
+                                   const long timeout_secs) const
     -> std::pair<boost::optional<std::string>, int>
 {
   /*  Fetch from /users/{USER_ID}/credentials/OS-EC2/{ACCESS_KEY_ID} */
@@ -516,7 +528,7 @@ auto EC2Engine::get_secret_from_keystone(const DoutPrefixProvider* dpp,
   keystone_url.append("users/");
   keystone_url.append(user_id);
   keystone_url.append("/credentials/OS-EC2/");
-  keystone_url.append(std::string(access_key_id));
+  keystone_url.append(access_key_id);
 
   /* get authentication token for Keystone. */
   std::string admin_token;
@@ -541,6 +553,7 @@ auto EC2Engine::get_secret_from_keystone(const DoutPrefixProvider* dpp,
 
   /* check if we want to verify keystone's ssl certs */
   secret.set_verify_ssl(cct->_conf->rgw_keystone_verify_ssl);
+  set_timeout(secret, timeout_secs);
 
   /* send request */
   ret = secret.process(dpp, y);
@@ -583,6 +596,32 @@ auto EC2Engine::get_secret_from_keystone(const DoutPrefixProvider* dpp,
   return make_pair(secret_string, 0);
 }
 
+FetchResult CredentialFetcher::fetch(const DoutPrefixProvider* dpp,
+                                     const SignedSample& sample,
+                                     optional_yield y,
+                                     const long timeout_secs) const
+{
+  FetchResult r;
+  try {
+    std::tie(r.token, r.failure_reason) =
+        get_token(dpp, sample, y, timeout_secs);
+
+    if (r.token) {
+      /* Fetch secret from keystone for the access_key_id */
+      std::tie(r.secret, r.failure_reason) =
+          get_secret(dpp, r.token->get_user_id(), sample.access_key_id, y,
+                     timeout_secs);
+    }
+  } catch (const int err) {
+    r.thrown = err;
+  } catch (const boost::context::detail::forced_unwind&) {
+    throw;  // a suspended coroutine is being destroyed: let it unwind
+  } catch (...) {
+    r.eptr = std::current_exception();
+  }
+  return r;
+}
+
 /*
  * Try to get a token for S3 authentication, using a secret cache if available
  */
@@ -596,50 +635,18 @@ auto EC2Engine::get_access_token(const DoutPrefixProvider* dpp,
     -> access_token_result
 {
   using server_signature_t = VersionAbstractor::server_signature_t;
-  boost::optional<rgw::keystone::TokenEnvelope> token;
-  boost::optional<std::string> secret;
-  int failure_reason;
-
-  /* Get a token from the cache if one has already been stored */
-  boost::optional<boost::tuple<rgw::keystone::TokenEnvelope, std::string>>
-    t = secret_cache.find(std::string(access_key_id));
+  const SignedSample sample{std::string(access_key_id), string_to_sign,
+                            std::string(signature)};
 
   /* Check that credentials can correctly be used to sign data */
-  if (t) {
-    /* We should ignore checking signature in cache if caller tells us to which
-     * means we're handling a HTTP OPTIONS call. */
-    if (ignore_signature) {
-      ldpp_dout(dpp, 20) << "ignore_signature set and found in cache" << dendl;
-      return {t->get<0>(), t->get<1>(), 0};
-    } else {
-      std::string sig(signature);
-      server_signature_t server_signature = signature_factory(cct, t->get<1>(), string_to_sign);
-      if (sig.compare(server_signature) == 0) {
-        return {t->get<0>(), t->get<1>(), 0};
-      } else {
-        ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
-      }
-    }
-  } else {
-    ldpp_dout(dpp, 0) << "No stored secret string, cache miss" << dendl;
-  }
+  const auto verify = [&] (const std::string& secret) {
+    const server_signature_t server_signature =
+        signature_factory(cct, secret, string_to_sign);
+    return sample.signature.compare(server_signature) == 0;
+  };
 
-  /* No cached token, token expired, or secret invalid: fall back to keystone */
-  std::tie(token, failure_reason) =
-      get_from_keystone(dpp, access_key_id, string_to_sign, signature, y);
-
-  if (token) {
-    /* Fetch secret from keystone for the access_key_id */
-    std::tie(secret, failure_reason) =
-        get_secret_from_keystone(dpp, token->get_user_id(), access_key_id, y);
-
-    if (secret) {
-      /* Add token, secret pair to cache, and set timeout */
-      secret_cache.add(std::string(access_key_id), *token, *secret);
-    }
-  }
-
-  return {token, secret, failure_reason};
+  return secret_cache.get_or_fetch(dpp, sample, verify, ignore_signature,
+                                   fetch_fn, y);
 }
 
 EC2Engine::acl_strategy_t
@@ -771,31 +778,56 @@ rgw::auth::Engine::result_t EC2Engine::authenticate(
   }
 }
 
+SecretCache::SecretCache(CephContext* const cct)
+  : cct(cct),
+    lock(),
+    max(cct->_conf->rgw_keystone_token_cache_size),
+    s3_token_expiry_length(cct->_conf->rgw_keystone_token_cache_ttl, 0) {
+}
+
+void SecretCache::erase_locked(std::map<std::string, secret_entry>::iterator iter)
+{
+  secrets_lru.erase(iter->second.lru_iter);
+  secrets.erase(iter);
+}
+
+SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id)
+{
+  lookup_result result;
+  const utime_t now = now_fn();
+  std::lock_guard<std::mutex> l(lock);
+
+  auto iter = secrets.find(access_key_id);
+  if (iter == secrets.end()) {
+    return result;
+  }
+
+  secret_entry& entry = iter->second;
+  if (entry.token.expired() || now > entry.expires) {
+    erase_locked(iter);
+    return result;
+  }
+
+  secrets_lru.erase(entry.lru_iter);
+  secrets_lru.push_front(access_key_id);
+  entry.lru_iter = secrets_lru.begin();
+
+  result.found = true;
+  result.token = entry.token;
+  result.secret = entry.secret;
+  return result;
+}
+
 bool SecretCache::find(const std::string& token_id,
                        SecretCache::token_envelope_t& token,
 		       std::string &secret)
 {
-  std::lock_guard<std::mutex> l(lock);
-
-  map<std::string, secret_entry>::iterator iter = secrets.find(token_id);
-  if (iter == secrets.end()) {
+  lookup_result result = lookup(token_id);
+  if (!result.found) {
     return false;
   }
-
-  secret_entry& entry = iter->second;
-  secrets_lru.erase(entry.lru_iter);
-
-  const utime_t now = ceph_clock_now();
-  if (entry.token.expired() || now > entry.expires) {
-    secrets.erase(iter);
-    return false;
-  }
-  token = entry.token;
-  secret = entry.secret;
-
-  secrets_lru.push_front(token_id);
-  entry.lru_iter = secrets_lru.begin();
-
+  token = std::move(result.token);
+  secret = std::move(result.secret);
   return true;
 }
 
@@ -811,7 +843,7 @@ void SecretCache::add(const std::string& token_id,
     secrets_lru.erase(e.lru_iter);
   }
 
-  const utime_t now = ceph_clock_now();
+  const utime_t now = now_fn();
   secrets_lru.push_front(token_id);
   secret_entry& entry = secrets[token_id];
   entry.token = token;
@@ -826,6 +858,76 @@ void SecretCache::add(const std::string& token_id,
     secrets.erase(iter);
     secrets_lru.pop_back();
   }
+}
+
+size_t SecretCache::size()
+{
+  std::lock_guard<std::mutex> l(lock);
+  return secrets.size();
+}
+
+FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
+                                       const SignedSample& sample,
+                                       const fetch_fn& fetch,
+                                       optional_yield y,
+                                       const long timeout_secs)
+{
+  FetchResult r;
+  try {
+    r = fetch(dpp, sample, y, timeout_secs);
+  } catch (const int err) {
+    r.thrown = err;
+  } catch (...) {
+    r.eptr = std::current_exception();
+  }
+
+  if (r.token && r.secret) {
+    /* Add token, secret pair to cache, and set timeout */
+    add(sample.access_key_id, *r.token, *r.secret);
+  }
+  return r;
+}
+
+SecretCache::access_result SecretCache::to_access_result(FetchResult&& r)
+{
+  if (r.eptr) {
+    std::rethrow_exception(r.eptr);
+  }
+  if (r.thrown) {
+    throw *r.thrown;
+  }
+  return {std::move(r.token), std::move(r.secret), r.failure_reason};
+}
+
+SecretCache::access_result
+SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
+                          const SignedSample& sample,
+                          verify_fn verify,
+                          const bool ignore_signature,
+                          const fetch_fn& fetch,
+                          optional_yield y)
+{
+  /* Get a token from the cache if one has already been stored */
+  const lookup_result cached = lookup(sample.access_key_id);
+
+  /* Check that credentials can correctly be used to sign data */
+  if (cached.found) {
+    /* We should ignore checking signature in cache if caller tells us to which
+     * means we're handling a HTTP OPTIONS call. */
+    if (ignore_signature) {
+      ldpp_dout(dpp, 20) << "ignore_signature set and found in cache" << dendl;
+      return {cached.token, cached.secret, 0};
+    }
+    if (verify(cached.secret)) {
+      return {cached.token, cached.secret, 0};
+    }
+    ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
+  } else {
+    ldpp_dout(dpp, 0) << "No stored secret string, cache miss" << dendl;
+  }
+
+  /* No cached token, token expired, or secret invalid: fall back to keystone */
+  return to_access_result(fetch_and_add(dpp, sample, fetch, y, 0));
 }
 
 }; /* namespace keystone */
