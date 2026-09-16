@@ -238,9 +238,15 @@ class SecretCacheTest : public ::testing::Test {
   void SetUp() override
   {
     fake_now_secs = 1'000'000;
+    perfcounter->reset();
     set_conf("rgw_keystone_token_cache_size", "10000");
     set_conf("rgw_keystone_token_cache_ttl", "300");
     reset_cache();
+  }
+
+  static uint64_t counter(int idx)
+  {
+    return perfcounter->get(idx);
   }
 
   void set_conf(const char* name, const char* value)
@@ -377,6 +383,8 @@ TEST_F(SecretCacheTest, VerifiedHitIsServedWithoutFetch)
   const Outcome o = call(Request{}, fetcher, null_yield);
   EXPECT_TRUE(o.granted("s3cr3t"));
   EXPECT_EQ(0, fetcher.calls());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_hit));
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_miss));
 }
 
 TEST_F(SecretCacheTest, MissFetchesAndCaches)
@@ -386,8 +394,10 @@ TEST_F(SecretCacheTest, MissFetchesAndCaches)
   EXPECT_TRUE(o.granted("s3cr3t"));
   EXPECT_EQ(1, fetcher.calls());
   EXPECT_EQ(1u, cache->size());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_miss));
   EXPECT_TRUE(call(Request{}, fetcher, null_yield).granted("s3cr3t"));
   EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_hit));
 }
 
 TEST_F(SecretCacheTest, MissFetchesAndCachesWithYield)
@@ -409,6 +419,7 @@ TEST_F(SecretCacheTest, MismatchingSignatureFetchesAndReplaces)
   const Outcome o = call(req, fetcher, null_yield);
   EXPECT_TRUE(o.granted("new-secret"));
   EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_miss));
   auto t = cache->find("AKID");
   ASSERT_TRUE(t);
   EXPECT_EQ("new-secret", t->get<1>());
@@ -423,6 +434,7 @@ TEST_F(SecretCacheTest, IgnoreSignatureHitSkipsVerification)
   req.ignore_signature = true;
   EXPECT_TRUE(call(req, fetcher, null_yield).granted("s3cr3t"));
   EXPECT_EQ(0, fetcher.calls());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_hit));
 }
 
 TEST_F(SecretCacheTest, SignatureMismatchFromKeystoneIsPassedThrough)

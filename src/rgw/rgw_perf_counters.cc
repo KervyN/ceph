@@ -30,6 +30,11 @@ void add_rgw_frontend_counters(PerfCountersBuilder *pcb) {
   pcb->add_u64_counter(l_rgw_keystone_token_cache_hit, "keystone_token_cache_hit", "Keystone token cache hits");
   pcb->add_u64_counter(l_rgw_keystone_token_cache_miss, "keystone_token_cache_miss", "Keystone token cache miss");
 
+  pcb->add_u64_counter(l_rgw_keystone_secret_cache_hit, "keystone_secret_cache_hit",
+                       "Keystone S3 credential cache hits");
+  pcb->add_u64_counter(l_rgw_keystone_secret_cache_miss, "keystone_secret_cache_miss",
+                       "Keystone S3 credential cache misses");
+
   pcb->add_u64_counter(l_rgw_gc_retire, "gc_retire_object", "GC object retires");
 
   pcb->add_u64_counter(l_rgw_lc_expire_current, "lc_expire_current",

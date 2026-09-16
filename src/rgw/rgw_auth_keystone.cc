@@ -22,6 +22,7 @@
 #include "rgw_auth_keystone.h"
 #include "rgw_rest_s3.h"
 #include "rgw_auth_s3.h"
+#include "rgw_perf_counters.h"
 
 #include "common/ceph_crypto.h"
 #include "common/Cond.h"
@@ -778,6 +779,13 @@ rgw::auth::Engine::result_t EC2Engine::authenticate(
   }
 }
 
+static void count(const int counter)
+{
+  if (perfcounter) {
+    perfcounter->inc(counter);
+  }
+}
+
 SecretCache::SecretCache(CephContext* const cct)
   : cct(cct),
     lock(),
@@ -916,15 +924,18 @@ SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
      * means we're handling a HTTP OPTIONS call. */
     if (ignore_signature) {
       ldpp_dout(dpp, 20) << "ignore_signature set and found in cache" << dendl;
+      count(l_rgw_keystone_secret_cache_hit);
       return {cached.token, cached.secret, 0};
     }
     if (verify(cached.secret)) {
+      count(l_rgw_keystone_secret_cache_hit);
       return {cached.token, cached.secret, 0};
     }
     ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
   } else {
     ldpp_dout(dpp, 0) << "No stored secret string, cache miss" << dendl;
   }
+  count(l_rgw_keystone_secret_cache_miss);
 
   /* No cached token, token expired, or secret invalid: fall back to keystone */
   return to_access_result(fetch_and_add(dpp, sample, fetch, y, 0));
