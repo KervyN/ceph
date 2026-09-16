@@ -109,10 +109,15 @@ FetchResult token_without_secret(int failure_reason,
 /* ---- fake Keystone ------------------------------------------------------ */
 
 /* Copyable functor (SecretCache::fetch_fn copies it); all state is shared.
- * The gate holds every fetch that arrives while it is closed: a coroutine
- * suspends on its own yield_waiter, a thread blocks on the condition
- * variable. open() releases all of them. */
+ * The gate holds a fetch that arrives while hold(call_no) says so: a
+ * coroutine suspends on its own yield_waiter, a thread blocks on the
+ * condition variable. open_gate() releases all of them, release_next() the
+ * oldest one. */
 class FakeFetcher {
+  struct Parked {
+    std::unique_ptr<ceph::async::yield_waiter<void>> waiter;  // coroutine
+    bool released = false;                                    // thread
+  };
   struct State {
     std::atomic<int> calls{0};
     std::atomic<int> concurrent{0};
@@ -120,9 +125,9 @@ class FakeFetcher {
     std::function<FetchResult(int call_no, const SignedSample&)> script;
 
     std::mutex mutex;
-    bool gate_open = true;
+    std::function<bool(int call_no)> hold;
     std::condition_variable cond;
-    std::list<std::unique_ptr<ceph::async::yield_waiter<void>>> waiters;
+    std::list<std::shared_ptr<Parked>> parked;
     std::vector<long> timeouts;
   };
   std::shared_ptr<State> st = std::make_shared<State>();
@@ -137,23 +142,38 @@ class FakeFetcher {
   {
     st->script = std::move(s);
   }
-  void close_gate()
+  /* hold the fetches for which pred(call_no) is true */
+  void hold_calls(std::function<bool(int)> pred)
   {
     std::lock_guard l{st->mutex};
-    st->gate_open = false;
+    st->hold = std::move(pred);
+  }
+  void close_gate()
+  {
+    hold_calls([] (int) { return true; });
   }
   void open_gate()
   {
-    std::list<std::unique_ptr<ceph::async::yield_waiter<void>>> waiters;
+    std::list<std::shared_ptr<Parked>> parked;
     {
       std::lock_guard l{st->mutex};
-      st->gate_open = true;
-      waiters.swap(st->waiters);
+      st->hold = nullptr;
+      parked.swap(st->parked);
     }
-    st->cond.notify_all();
-    for (auto& w : waiters) {
-      w->complete(boost::system::error_code{});
+    for (auto& p : parked) {
+      release(*p);
     }
+  }
+  void release_next()
+  {
+    std::shared_ptr<Parked> p;
+    {
+      std::lock_guard l{st->mutex};
+      ASSERT_FALSE(st->parked.empty());
+      p = std::move(st->parked.front());
+      st->parked.pop_front();
+    }
+    release(*p);
   }
   int calls() const { return st->calls.load(); }
   int max_concurrent() const { return st->max_concurrent.load(); }
@@ -162,11 +182,11 @@ class FakeFetcher {
     std::lock_guard l{st->mutex};
     return st->timeouts;
   }
-  /* number of fetches currently parked at the closed gate */
+  /* number of fetches currently parked at the gate */
   size_t parked() const
   {
     std::lock_guard l{st->mutex};
-    return st->waiters.size();
+    return st->parked.size();
   }
 
   FetchResult operator()(const DoutPrefixProvider*, const SignedSample& sample,
@@ -181,25 +201,36 @@ class FakeFetcher {
       std::lock_guard l{st->mutex};
       st->timeouts.push_back(timeout_secs);
     }
-    wait_at_gate(y);
+    wait_at_gate(call_no, y);
     --st->concurrent;
     return st->script(call_no, sample);
   }
 
  private:
-  void wait_at_gate(optional_yield y) const
+  void release(Parked& p)
+  {
+    if (p.waiter) {
+      p.waiter->complete(boost::system::error_code{});
+    } else {
+      std::lock_guard l{st->mutex};
+      p.released = true;
+      st->cond.notify_all();
+    }
+  }
+
+  void wait_at_gate(int call_no, optional_yield y) const
   {
     std::unique_lock l{st->mutex};
-    if (st->gate_open) {
+    if (!st->hold || !st->hold(call_no)) {
       return;
     }
+    auto p = st->parked.emplace_back(std::make_shared<Parked>());
     if (y) {
-      auto& waiter = *st->waiters.emplace_back(
-          std::make_unique<ceph::async::yield_waiter<void>>());
+      p->waiter = std::make_unique<ceph::async::yield_waiter<void>>();
       /* releases the lock right before the coroutine suspends */
-      waiter.async_wait(l, y.get_yield_context());
+      p->waiter->async_wait(l, y.get_yield_context());
     } else {
-      st->cond.wait(l, [this] { return st->gate_open; });
+      st->cond.wait(l, [&] { return p->released; });
     }
   }
 };
@@ -254,11 +285,36 @@ class SecretCacheTest : public ::testing::Test {
     ASSERT_EQ(0, cct->_conf.set_val(name, value));
   }
 
+  void TearDown() override
+  {
+    set_conf("rgw_keystone_token_cache_coalesce_misses", "false");
+  }
+
   /* the cache snapshots size and ttl in its constructor */
   void reset_cache()
   {
     cache = std::make_unique<SecretCache>(cct);
     cache->set_clock_for_testing(fake_clock);
+  }
+
+  void enable_coalescing()
+  {
+    set_conf("rgw_keystone_token_cache_coalesce_misses", "true");
+  }
+
+  static std::vector<Request> requests(size_t n, const Request& req = Request{})
+  {
+    return std::vector<Request>(n, req);
+  }
+
+  static size_t count_granted(const std::vector<Outcome>& outcomes,
+                              const std::string& secret)
+  {
+    size_t n = 0;
+    for (const auto& o : outcomes) {
+      n += o.granted(secret);
+    }
+    return n;
   }
 
   Outcome call(const Request& req, const FakeFetcher& fetcher, optional_yield y)
@@ -297,12 +353,15 @@ class SecretCacheTest : public ::testing::Test {
     return outcomes;
   }
 
+  using parked_fn = std::function<void(boost::asio::io_context&)>;
+
   /* N requests as coroutines on one io_context, driven single-threaded
    * (deterministic). while_parked() runs after poll() with everything
-   * suspended, typically to open the fetcher's gate. */
+   * suspended, typically to open the fetcher's gate; step() lets it run
+   * the context in between. */
   std::vector<Outcome> run_coroutines(const std::vector<Request>& reqs,
                                       const FakeFetcher& fetcher,
-                                      const std::function<void()>& while_parked = {})
+                                      const parked_fn& while_parked = {})
   {
     boost::asio::io_context ctx;
     std::vector<Outcome> outcomes(reqs.size());
@@ -315,11 +374,40 @@ class SecretCacheTest : public ::testing::Test {
     }
     ctx.poll();
     if (while_parked) {
-      while_parked();
+      while_parked(ctx);
       ctx.restart();
       ctx.run();
     }
     EXPECT_TRUE(ctx.stopped());
+    return outcomes;
+  }
+
+  static void step(boost::asio::io_context& ctx)
+  {
+    ctx.restart();
+    ctx.poll();
+  }
+
+  /* N request coroutines on an io_context run by `threads` OS threads */
+  std::vector<Outcome> run_coroutines_threaded(const std::vector<Request>& reqs,
+                                               const FakeFetcher& fetcher,
+                                               int threads)
+  {
+    boost::asio::io_context ctx;
+    std::vector<Outcome> outcomes(reqs.size());
+    for (size_t i = 0; i < reqs.size(); ++i) {
+      boost::asio::spawn(ctx, [&, i] (boost::asio::yield_context yield) {
+            outcomes[i] = call(reqs[i], fetcher, optional_yield{yield});
+          }, [] (std::exception_ptr eptr) {
+            if (eptr) std::rethrow_exception(eptr);
+          });
+    }
+    {
+      std::vector<std::jthread> runners;
+      for (int i = 0; i < threads; ++i) {
+        runners.emplace_back([&ctx] { ctx.run(); });
+      }
+    }
     return outcomes;
   }
 };
@@ -499,6 +587,304 @@ TEST_F(SecretCacheTest, ExceptionThrownByFetchIsRethrown)
   const Outcome o = call(Request{}, fetcher, null_yield);
   ASSERT_TRUE(o.eptr);
   EXPECT_THROW(std::rethrow_exception(o.eptr), std::runtime_error);
+}
+
+/* ---- coalescing of concurrent misses ----------------------------------- */
+
+TEST_F(SecretCacheTest, CoalescingIsOffByDefault)
+{
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(8), fetcher, [&] (auto&) {
+      EXPECT_EQ(8u, fetcher.parked());   // every request talks to Keystone
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(8, fetcher.calls());
+  EXPECT_EQ(8u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_coalesced));
+}
+
+TEST_F(SecretCacheTest, Coalesce2000ParallelMissesFetchOnce)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(2000), fetcher, [&] (auto&) {
+      EXPECT_EQ(1, fetcher.calls());
+      EXPECT_EQ(1u, fetcher.parked());
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(2000u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(1999u, counter(l_rgw_keystone_secret_cache_coalesced));
+  EXPECT_EQ(2000u, counter(l_rgw_keystone_secret_cache_miss));
+  EXPECT_EQ(0u, cache->inflight_size());
+  EXPECT_EQ(1u, cache->size());
+}
+
+TEST_F(SecretCacheTest, CoalesceParallelMissesOnIoThreads)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  const auto outcomes = run_coroutines_threaded(requests(500), fetcher, 4);
+  EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(500u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(0u, cache->inflight_size());
+}
+
+TEST_F(SecretCacheTest, CoalesceParallelMissesOnThreadsNullYield)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+  const auto outcomes = run_threads(requests(64), fetcher, [&] {
+      /* let most threads reach the flight before releasing the leader */
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(64u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(0u, cache->inflight_size());
+}
+
+TEST_F(SecretCacheTest, CoalescedWaiterVerifiesOwnSignature)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample& s) {
+      return s.signature == "bad" ? failed_result(-ERR_SIGNATURE_NO_MATCH) : ok_result(); });
+  fetcher.close_gate();
+  std::vector<Request> reqs = requests(3);
+  reqs[2].sample.signature = "bad";
+  reqs[2].expected_secret = "nothing-verifies";
+  const auto outcomes = run_coroutines(reqs, fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_TRUE(outcomes[0].granted("s3cr3t"));
+  EXPECT_TRUE(outcomes[1].granted("s3cr3t"));
+  /* the mismatching waiter does not inherit the grant: Keystone judges
+   * its own sample, as it does for a mismatching cache hit */
+  EXPECT_TRUE(outcomes[2].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_EQ(2, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, OptionsRequestsBypassCoalescing)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+  std::vector<Request> reqs = requests(3);
+  reqs[1].ignore_signature = true;   // has no signature to verify a shared secret with
+  reqs[2].ignore_signature = true;
+  /* the OPTIONS misses fetch on their own, as today, even while a flight is open */
+  const auto outcomes = run_coroutines(reqs, fetcher, [&] (auto&) {
+      EXPECT_EQ(3u, fetcher.parked());
+      EXPECT_EQ(1u, cache->inflight_size());
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(3, fetcher.calls());
+  EXPECT_EQ(3u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_coalesced));
+}
+
+TEST_F(SecretCacheTest, DistinctAccessKeysCoalesceIndependently)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample& s) {
+      return ok_result("secret-" + s.access_key_id); });
+  fetcher.close_gate();
+  std::vector<Request> reqs;
+  for (int i = 0; i < 20; ++i) {
+    const std::string akid = i % 2 ? "A" : "B";
+    reqs.push_back(Request{make_sample(akid), "secret-" + akid});
+  }
+  const auto outcomes = run_coroutines(reqs, fetcher, [&] (auto&) {
+      EXPECT_EQ(2u, fetcher.parked());
+      EXPECT_EQ(2u, cache->inflight_size());
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(2, fetcher.calls());
+  EXPECT_EQ(10u, count_granted(outcomes, "secret-A"));
+  EXPECT_EQ(10u, count_granted(outcomes, "secret-B"));
+  EXPECT_EQ(18u, counter(l_rgw_keystone_secret_cache_coalesced));
+  EXPECT_EQ(0u, cache->inflight_size());
+  EXPECT_EQ(2u, cache->size());
+}
+
+TEST_F(SecretCacheTest, Leader401IsNotInheritedWaitersRetryOnce)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) {
+      return call_no == 1 ? failed_result(-ERR_SIGNATURE_NO_MATCH) : ok_result(); });
+  fetcher.close_gate();
+  std::vector<Request> reqs = requests(11);
+  reqs[0].sample.signature = "bad";
+  reqs[0].expected_secret = "nothing-verifies";
+  const auto outcomes = run_coroutines(reqs, fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_TRUE(outcomes[0].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_EQ(10u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(2, fetcher.calls());          // one for the bad leader, one for the rest
+  EXPECT_EQ(1, fetcher.max_concurrent()); // never in parallel
+  EXPECT_EQ(0u, cache->inflight_size());
+}
+
+TEST_F(SecretCacheTest, WaitersFallBackToDirectFetchAfterTwoRounds)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample& s) {
+      return s.signature == "bad" ? failed_result(-ERR_SIGNATURE_NO_MATCH) : ok_result(); });
+  fetcher.close_gate();
+  std::vector<Request> reqs = requests(4);
+  for (int i = 0; i < 3; ++i) {
+    reqs[i].sample.signature = "bad";
+    reqs[i].expected_secret = "nothing-verifies";
+  }
+  const auto outcomes = run_coroutines(reqs, fetcher, [&] (auto& ctx) {
+      fetcher.release_next();  // bad leader 1 gets 401
+      step(ctx);               // bad 2 leads the next round, bad 3 and good wait
+      fetcher.release_next();  // bad leader 2 gets 401
+      step(ctx);               // bad 3 and good have waited twice: both fetch directly
+      EXPECT_EQ(2u, fetcher.parked());
+      fetcher.open_gate();
+    });
+  EXPECT_TRUE(outcomes[0].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_TRUE(outcomes[1].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_TRUE(outcomes[2].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_TRUE(outcomes[3].granted("s3cr3t"));
+  EXPECT_EQ(4, fetcher.calls());
+  EXPECT_EQ(2, fetcher.max_concurrent());  // the two direct fetches overlapped
+}
+
+TEST_F(SecretCacheTest, InvalidAccessKeyIsSharedByWaiters)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) {
+      return failed_result(-ERR_INVALID_ACCESS_KEY); });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(50), fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_EQ(1, fetcher.calls());
+  for (const auto& o : outcomes) {
+    EXPECT_TRUE(o.denied(-ERR_INVALID_ACCESS_KEY));
+  }
+  EXPECT_EQ(49u, counter(l_rgw_keystone_secret_cache_coalesced));
+  EXPECT_EQ(0u, cache->size());
+}
+
+TEST_F(SecretCacheTest, ThrownIntIsSharedByWaitersAndNotSticky)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) -> FetchResult {
+      if (call_no == 1) throw -ERR_INTERNAL_ERROR;
+      return ok_result(); });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(50), fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_EQ(1, fetcher.calls());
+  for (const auto& o : outcomes) {
+    ASSERT_TRUE(o.thrown_int);
+    EXPECT_EQ(-ERR_INTERNAL_ERROR, *o.thrown_int);
+  }
+  EXPECT_EQ(0u, cache->inflight_size());
+  /* the error was not cached: the next miss contacts Keystone again */
+  EXPECT_TRUE(call(Request{}, fetcher, null_yield).granted("s3cr3t"));
+  EXPECT_EQ(2, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, ThrownIntIsSharedByThreadsNullYield)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) -> FetchResult {
+      throw -EBUSY; });
+  fetcher.close_gate();
+  const auto outcomes = run_threads(requests(16), fetcher, [&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(1, fetcher.calls());
+  for (const auto& o : outcomes) {
+    ASSERT_TRUE(o.thrown_int);
+    EXPECT_EQ(-EBUSY, *o.thrown_int);
+  }
+}
+
+TEST_F(SecretCacheTest, NonStandardExceptionIsSharedByWaiters)
+{
+  /* once_result only catches std::exception; anything else must be folded
+   * before it gets there or the waiters would never wake up */
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) -> FetchResult { throw 42u; });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(20), fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_EQ(1, fetcher.calls());
+  for (const auto& o : outcomes) {
+    ASSERT_TRUE(o.eptr);
+    EXPECT_THROW(std::rethrow_exception(o.eptr), unsigned);
+  }
+  EXPECT_EQ(0u, cache->inflight_size());
+}
+
+TEST_F(SecretCacheTest, ExceptionIsSharedByWaiters)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) -> FetchResult {
+      throw std::runtime_error("boom"); });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(5), fetcher, [&] (auto&) { fetcher.open_gate(); });
+  EXPECT_EQ(1, fetcher.calls());
+  for (const auto& o : outcomes) {
+    ASSERT_TRUE(o.eptr);
+    EXPECT_THROW(std::rethrow_exception(o.eptr), std::runtime_error);
+  }
+  EXPECT_EQ(0u, cache->inflight_size());
+}
+
+TEST_F(SecretCacheTest, TokenWithoutSecretIsNotInheritedByWaiters)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) {
+      return call_no == 1 ? token_without_secret(-EACCES) : ok_result(); });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(6), fetcher, [&] (auto&) { fetcher.open_gate(); });
+  /* the leader keeps today's outcome: token, no secret */
+  ASSERT_TRUE(outcomes[0].result);
+  EXPECT_TRUE(outcomes[0].result->token);
+  EXPECT_FALSE(outcomes[0].result->secret_key);
+  /* the waiters could not verify anything and looked again */
+  EXPECT_EQ(5u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(2, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, MissWhileFlightOpenJoinsIt)
+{
+  enable_coalescing();
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+  boost::asio::io_context ctx;
+  Outcome first, second;
+  boost::asio::spawn(ctx, [&] (boost::asio::yield_context yield) {
+        first = call(Request{}, fetcher, optional_yield{yield});
+      }, [] (std::exception_ptr) {});
+  ctx.poll();
+  EXPECT_EQ(1u, cache->inflight_size());
+  boost::asio::spawn(ctx, [&] (boost::asio::yield_context yield) {
+        second = call(Request{}, fetcher, optional_yield{yield});
+      }, [] (std::exception_ptr) {});
+  ctx.restart();
+  ctx.poll();
+  EXPECT_EQ(1, fetcher.calls());
+  fetcher.open_gate();
+  ctx.restart();
+  ctx.run();
+  EXPECT_TRUE(first.granted("s3cr3t"));
+  EXPECT_TRUE(second.granted("s3cr3t"));
+  EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_coalesced));
 }
 
 } // anonymous namespace

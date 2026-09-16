@@ -1034,6 +1034,24 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_keystone_token_cache_coalesce_misses
+  type: bool
+  level: advanced
+  desc: Coalesce concurrent Keystone lookups of the same S3 access key
+  long_desc: When an S3 access key is not in the Keystone credential cache and
+    several requests for it arrive at the same time, only one of them contacts
+    Keystone (``POST /v3/s3tokens`` followed by the credential lookup) while
+    the others wait for that result and verify their own signature against the
+    fetched secret locally. A transient Keystone error (429, 5xx, timeout) is
+    shared with the waiting requests instead of being retried by each of them.
+    Turns a burst of identical Keystone requests after a cache miss or expiry
+    into a single one.
+  default: false
+  services:
+  - rgw
+  see_also:
+  - rgw_keystone_token_cache_ttl
+  with_legacy: true
 - name: rgw_keystone_verify_ssl
   type: bool
   level: advanced

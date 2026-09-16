@@ -34,6 +34,8 @@ void add_rgw_frontend_counters(PerfCountersBuilder *pcb) {
                        "Keystone S3 credential cache hits");
   pcb->add_u64_counter(l_rgw_keystone_secret_cache_miss, "keystone_secret_cache_miss",
                        "Keystone S3 credential cache misses");
+  pcb->add_u64_counter(l_rgw_keystone_secret_cache_coalesced, "keystone_secret_cache_coalesced",
+                       "Keystone S3 credential lookups that waited for a concurrent one");
 
   pcb->add_u64_counter(l_rgw_gc_retire, "gc_retire_object", "GC object retires");
 

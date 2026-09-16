@@ -823,6 +823,7 @@ SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id)
   result.found = true;
   result.token = entry.token;
   result.secret = entry.secret;
+  result.gen = entry.gen;
   return result;
 }
 
@@ -858,6 +859,7 @@ void SecretCache::add(const std::string& token_id,
   entry.secret = secret;
   entry.expires = now + s3_token_expiry_length;
   entry.lru_iter = secrets_lru.begin();
+  entry.gen = ++next_gen;
 
   while (secrets_lru.size() > max) {
     list<string>::reverse_iterator riter = secrets_lru.rbegin();
@@ -874,6 +876,68 @@ size_t SecretCache::size()
   return secrets.size();
 }
 
+size_t SecretCache::inflight_size()
+{
+  std::lock_guard<std::mutex> l(lock);
+  return inflight.size();
+}
+
+SecretCache::join_result
+SecretCache::join_or_create_flight(const std::string& access_key_id,
+                                   const uint64_t seen_gen)
+{
+  join_result result;
+  const utime_t now = now_fn();
+  std::lock_guard<std::mutex> l(lock);
+
+  if (auto iter = secrets.find(access_key_id); iter != secrets.end()) {
+    const secret_entry& entry = iter->second;
+    if (entry.gen != seen_gen &&
+        !entry.token.expired() && now <= entry.expires) {
+      result.late_hit = true;
+      return result;
+    }
+  }
+
+  if (auto iter = inflight.find(access_key_id); iter != inflight.end()) {
+    result.flight = iter->second;
+  } else {
+    result.flight = std::make_shared<Flight>();
+    inflight.emplace(access_key_id, result.flight);
+  }
+  return result;
+}
+
+void SecretCache::remove_flight_if(const std::string& access_key_id,
+                                   const flight_ptr& flight)
+{
+  std::lock_guard<std::mutex> l(lock);
+  auto iter = inflight.find(access_key_id);
+  if (iter != inflight.end() && iter->second == flight) {
+    inflight.erase(iter);
+  }
+}
+
+SecretCache::Outcome SecretCache::classify(const FetchResult& r) noexcept
+{
+  if (r.thrown || r.eptr) {
+    return Outcome::error;
+  }
+  if (r.token && r.secret) {
+    return Outcome::success;
+  }
+  if (r.token) {
+    return Outcome::token_without_secret;
+  }
+  if (r.failure_reason == -ERR_INVALID_ACCESS_KEY) {
+    return Outcome::invalid_key;
+  }
+  if (r.failure_reason == -ERR_SIGNATURE_NO_MATCH) {
+    return Outcome::sig_mismatch;
+  }
+  return Outcome::error;
+}
+
 FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
                                        const SignedSample& sample,
                                        const fetch_fn& fetch,
@@ -885,6 +949,8 @@ FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
     r = fetch(dpp, sample, y, timeout_secs);
   } catch (const int err) {
     r.thrown = err;
+  } catch (const boost::context::detail::forced_unwind&) {
+    throw;  // a suspended coroutine is being destroyed: let it unwind
   } catch (...) {
     r.eptr = std::current_exception();
   }
@@ -907,6 +973,64 @@ SecretCache::access_result SecretCache::to_access_result(FetchResult&& r)
   return {std::move(r.token), std::move(r.secret), r.failure_reason};
 }
 
+std::optional<SecretCache::access_result>
+SecretCache::serve_cached(const DoutPrefixProvider* dpp,
+                          const lookup_result& cached,
+                          verify_fn verify,
+                          const bool ignore_signature)
+{
+  /* Check that credentials can correctly be used to sign data */
+  if (cached.found) {
+    /* We should ignore checking signature in cache if caller tells us to
+     * which means we're handling a HTTP OPTIONS call. */
+    if (ignore_signature) {
+      ldpp_dout(dpp, 20) << "ignore_signature set and found in cache" << dendl;
+      count(l_rgw_keystone_secret_cache_hit);
+      return access_result{cached.token, cached.secret, 0};
+    }
+    if (verify(cached.secret)) {
+      count(l_rgw_keystone_secret_cache_hit);
+      return access_result{cached.token, cached.secret, 0};
+    }
+    ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
+  } else {
+    ldpp_dout(dpp, 0) << "No stored secret string, cache miss" << dendl;
+  }
+  count(l_rgw_keystone_secret_cache_miss);
+  return std::nullopt;
+}
+
+std::optional<SecretCache::access_result>
+SecretCache::use_shared_result(const DoutPrefixProvider* dpp,
+                               FetchResult&& r,
+                               verify_fn verify)
+{
+  count(l_rgw_keystone_secret_cache_coalesced);
+  switch (classify(r)) {
+    case Outcome::success:
+      /* Keystone validated the leader's signature, not ours */
+      if (verify(*r.secret)) {
+        return access_result{std::move(r.token), std::move(r.secret), 0};
+      }
+      /* as with a mismatching cache hit, let Keystone judge our sample */
+      ldpp_dout(dpp, 20) << "signature does not match the secret fetched by "
+                            "a concurrent request, retrying" << dendl;
+      return std::nullopt;
+    case Outcome::invalid_key:
+    case Outcome::error:
+      /* a verdict about the key, or an error every request would have hit */
+      return to_access_result(std::move(r));
+    case Outcome::sig_mismatch:
+    case Outcome::token_without_secret:
+      /* Keystone rejected the leader's sample; ours may still be fine, and
+       * without a secret we cannot tell locally */
+      ldpp_dout(dpp, 20) << "concurrent keystone lookup not usable for this "
+                            "request, retrying" << dendl;
+      return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 SecretCache::access_result
 SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
                           const SignedSample& sample,
@@ -915,30 +1039,49 @@ SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
                           const fetch_fn& fetch,
                           optional_yield y)
 {
-  /* Get a token from the cache if one has already been stored */
-  const lookup_result cached = lookup(sample.access_key_id);
+  const bool coalesce = cct->_conf->rgw_keystone_token_cache_coalesce_misses;
 
-  /* Check that credentials can correctly be used to sign data */
-  if (cached.found) {
-    /* We should ignore checking signature in cache if caller tells us to which
-     * means we're handling a HTTP OPTIONS call. */
-    if (ignore_signature) {
-      ldpp_dout(dpp, 20) << "ignore_signature set and found in cache" << dendl;
-      count(l_rgw_keystone_secret_cache_hit);
-      return {cached.token, cached.secret, 0};
+  for (int rounds_waited = 0;;) {
+    /* Get a token from the cache if one has already been stored */
+    const lookup_result cached = lookup(sample.access_key_id);
+    if (auto served = serve_cached(dpp, cached, verify, ignore_signature)) {
+      return std::move(*served);
     }
-    if (verify(cached.secret)) {
-      count(l_rgw_keystone_secret_cache_hit);
-      return {cached.token, cached.secret, 0};
+
+    /* No cached token, token expired, or secret invalid: fall back to
+     * keystone. An OPTIONS request (no signature to verify a shared
+     * result with) and a request that has waited twice go on their own. */
+    if (!coalesce || ignore_signature || rounds_waited >= max_coalesce_rounds) {
+      return to_access_result(fetch_and_add(dpp, sample, fetch, y, 0));
     }
-    ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
-  } else {
-    ldpp_dout(dpp, 0) << "No stored secret string, cache miss" << dendl;
+
+    /* Share the round trip with other requests that miss this key right
+     * now. A late hit counts as a round: a signature that keeps failing
+     * against secrets others fetch must not loop here for ever. */
+    const uint64_t seen_gen = cached.found ? cached.gen : 0;
+    const join_result joined = join_or_create_flight(sample.access_key_id,
+                                                     seen_gen);
+    if (joined.late_hit) {
+      ++rounds_waited;
+      continue;
+    }
+
+    const FlightGuard guard{*this, sample.access_key_id, joined.flight};
+    bool leader = false;
+    FetchResult r = call_once(joined.flight->once, y, [&] {
+        leader = true;
+        return fetch_and_add(dpp, sample, fetch, y, 0);
+      });
+
+    if (leader) {
+      /* Keystone judged this very sample */
+      return to_access_result(std::move(r));
+    }
+    if (auto shared = use_shared_result(dpp, std::move(r), verify)) {
+      return std::move(*shared);
+    }
+    ++rounds_waited;
   }
-  count(l_rgw_keystone_secret_cache_miss);
-
-  /* No cached token, token expired, or secret invalid: fall back to keystone */
-  return to_access_result(fetch_and_add(dpp, sample, fetch, y, 0));
 }
 
 }; /* namespace keystone */

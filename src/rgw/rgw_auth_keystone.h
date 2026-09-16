@@ -7,6 +7,7 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -16,6 +17,7 @@
 
 #include "include/function2.hpp"
 #include "common/Clock.h"
+#include "common/async/call_once.h"
 
 #include "rgw_auth.h"
 #include "rgw_rest_s3.h"
@@ -188,12 +190,45 @@ private:
     std::string secret;
     utime_t expires;
     std::list<std::string>::iterator lru_iter;
+    uint64_t gen = 0;  // bumped by every add(): tells a replaced entry apart
   };
 
   struct lookup_result {
     bool found = false;
     token_envelope_t token;
     std::string secret;
+    uint64_t gen = 0;
+  };
+
+  /* One Keystone lookup shared by every request that misses the same
+   * access key while it is in flight. Removed as soon as it completes,
+   * so errors are never cached. */
+  struct Flight {
+    ceph::async::once_result<FetchResult> once;
+  };
+  using flight_ptr = std::shared_ptr<Flight>;
+
+  struct join_result {
+    flight_ptr flight;
+    bool late_hit = false;  // the key was cached since the caller's lookup()
+  };
+
+  /* Whatever happens to the caller, the flight must not outlive its use: a
+   * completed flight left in the table would serve its result to every
+   * later miss for the key. */
+  struct FlightGuard {
+    SecretCache& cache;
+    const std::string& access_key_id;
+    const flight_ptr& flight;
+    ~FlightGuard() { cache.remove_flight_if(access_key_id, flight); }
+  };
+
+  enum class Outcome {
+    success,               // token and secret
+    invalid_key,           // 404: a verdict about the key, shareable
+    sig_mismatch,          // 401: a verdict about the leader's sample only
+    token_without_secret,  // token validated but no secret to verify with
+    error,                 // thrown int or exception: every caller gets it
   };
 
   const boost::intrusive_ptr<CephContext> cct;
@@ -209,10 +244,39 @@ private:
 
   clock_fn now_fn = ceph_clock_now;
 
+  std::map<std::string, flight_ptr> inflight;  // guarded by `lock`
+  uint64_t next_gen = 0;                       // guarded by `lock`
+
+  /* A request that waited on someone else's flight and could not use the
+   * outcome re-enters at most this often before it contacts Keystone on
+   * its own (today's behaviour). */
+  static constexpr int max_coalesce_rounds = 2;
+
   SecretCache() : SecretCache(g_ceph_context) {}
 
   lookup_result lookup(const std::string& access_key_id);
   void erase_locked(std::map<std::string, secret_entry>::iterator iter);
+
+  /* Join the flight for access_key_id, or start one. Checks the cache
+   * again first: a caller that finds the key cached since its lookup()
+   * (seen_gen) gets late_hit instead of a second round trip. */
+  join_result join_or_create_flight(const std::string& access_key_id,
+                                    uint64_t seen_gen);
+  void remove_flight_if(const std::string& access_key_id,
+                        const flight_ptr& flight);
+  static Outcome classify(const FetchResult& r) noexcept;
+
+  /* The cached credential if the sample verifies against it (or is an
+   * OPTIONS request); nullopt means Keystone has to be asked. */
+  std::optional<access_result> serve_cached(const DoutPrefixProvider* dpp,
+                                            const lookup_result& cached,
+                                            verify_fn verify,
+                                            bool ignore_signature);
+  /* What a request that waited for another request's Keystone lookup
+   * makes of the outcome; nullopt means it has to look again. */
+  std::optional<access_result> use_shared_result(const DoutPrefixProvider* dpp,
+                                                 FetchResult&& r,
+                                                 verify_fn verify);
 
   /* Run fetch() and cache a complete result. Folds an int thrown by
    * fetch() into the result. */
@@ -262,6 +326,7 @@ public:
   /* Test seams. */
   void set_clock_for_testing(clock_fn now) noexcept { now_fn = now; }
   size_t size();
+  size_t inflight_size();
 }; /* class SecretCache */
 
 class EC2Engine : public rgw::auth::s3::AWSEngine {
