@@ -1,5 +1,15 @@
 >=22.0.0
 
+* RGW: The Keystone S3 credential cache can now coalesce concurrent lookups of
+  the same access key (``rgw_keystone_token_cache_coalesce_misses``), refresh
+  cached credentials in the background before they expire
+  (``rgw_keystone_token_cache_refresh_enabled``,
+  ``rgw_keystone_token_cache_refresh_before``,
+  ``rgw_keystone_token_cache_refresh_max_concurrent``) and jitter their
+  lifetime (``rgw_keystone_token_cache_ttl_jitter``). All options are off by
+  default; behaviour is unchanged unless they are enabled. New
+  ``keystone_secret_cache_*`` performance counters report hits, misses,
+  coalesced lookups and refresh outcomes.
 * RGW: The default value of ``rgw_rest_conn_connect_to_resolved_ips`` changed
   from ``false`` to ``true``.
 * RGW: The default value of ``rgw_rest_conn_ip_fail_timeout_secs`` changed

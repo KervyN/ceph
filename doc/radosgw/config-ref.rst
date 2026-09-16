@@ -239,6 +239,12 @@ Keystone Settings
 .. confval:: rgw_keystone_admin_password_path
 .. confval:: rgw_keystone_accepted_roles
 .. confval:: rgw_keystone_token_cache_size
+.. confval:: rgw_keystone_token_cache_ttl
+.. confval:: rgw_keystone_token_cache_coalesce_misses
+.. confval:: rgw_keystone_token_cache_refresh_enabled
+.. confval:: rgw_keystone_token_cache_refresh_before
+.. confval:: rgw_keystone_token_cache_refresh_max_concurrent
+.. confval:: rgw_keystone_token_cache_ttl_jitter
 .. confval:: rgw_keystone_verify_ssl
 .. confval:: rgw_keystone_service_token_enabled
 .. confval:: rgw_keystone_service_token_accepted_roles

@@ -191,6 +191,60 @@ policies and idenitity policies with ``StringEquals``, ``StringNotEquals`` etc.
 
 See :doc:`bucketpolicy` for list of supported condition keys.
 
+S3 Credential Cache
+~~~~~~~~~~~~~~~~~~~
+
+Validating an S3 request against Keystone costs two round trips
+(``POST /v3/s3tokens`` and a credential lookup), so each gateway caches the
+validated credential of an access key for :confval:`rgw_keystone_token_cache_ttl`
+seconds (:confval:`rgw_keystone_token_cache_size` entries at most) and verifies
+later requests locally against the cached secret. When an entry expires, every
+request for that access key that is in flight at that moment misses the cache
+and contacts Keystone on its own. Behind a rate-limited Keystone this burst of
+identical requests can be answered with ``429``, which fails the client requests.
+Two options remove the burst; both are off by default:
+
+* :confval:`rgw_keystone_token_cache_coalesce_misses` lets concurrent misses for
+  the same access key share one Keystone lookup. The request that misses first
+  contacts Keystone; the others wait for its result (suspending their coroutine,
+  not blocking a thread) and verify their own signature against the fetched
+  secret locally. A transient Keystone error is shared with the waiting requests
+  instead of being retried by each of them. This also covers a cold start, where
+  many requests for one key arrive with an empty cache.
+
+* :confval:`rgw_keystone_token_cache_refresh_enabled` keeps hot entries warm.
+  When a request authenticates with a cached credential that has at most
+  :confval:`rgw_keystone_token_cache_refresh_before` seconds of lifetime left,
+  the gateway re-validates that credential in the background, reusing the
+  signature it has just verified, and replaces the entry. The request is served
+  from the cache immediately. At most one refresh is started per cached entry,
+  at most :confval:`rgw_keystone_token_cache_refresh_max_concurrent` run at the
+  same time, and credentials that are not in the cache are never fetched ahead
+  of time. A refresh that Keystone answers with ``404`` evicts the entry, so a
+  deleted credential stops working no later than before. Any other failure,
+  including ``401`` (which a stale admin token causes as well), leaves the
+  entry alone until it expires, exactly as today. Refreshes need asynchronous
+  request processing (``rgw_beast_enable_async``, the default).
+
+:confval:`rgw_keystone_token_cache_ttl_jitter` additionally shortens each entry's
+lifetime by a random number of seconds, so that credentials cached at the same
+moment, or the same credential on several gateways, do not expire in lock step.
+It never lengthens the lifetime.
+
+A gateway behind a rate-limited Keystone typically runs with::
+
+    rgw_keystone_token_cache_coalesce_misses = true
+    rgw_keystone_token_cache_refresh_enabled = true
+    rgw_keystone_token_cache_ttl_jitter = 30
+
+The ``keystone_secret_cache_*`` performance counters (``ceph daemon <rgw> perf
+dump``) show cache hits and misses, requests that waited for a concurrent
+lookup (``coalesced``) and refreshes started, completed (``refresh_ok``), failed
+transiently, evicting a deleted credential (``refresh_evicted``) or skipped
+(no asynchronous processing, concurrency limit reached, or a result that was
+superseded). A request that waits for a concurrent lookup and has to look again
+counts a second hit or miss.
+
 Service Token Support
 ---------------------
 
