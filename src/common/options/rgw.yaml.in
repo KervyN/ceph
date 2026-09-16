@@ -1052,6 +1052,58 @@ options:
   see_also:
   - rgw_keystone_token_cache_ttl
   with_legacy: true
+- name: rgw_keystone_token_cache_refresh_enabled
+  type: bool
+  level: advanced
+  desc: Refresh cached Keystone S3 credentials in the background before they expire
+  long_desc: When a request authenticates with a cached Keystone S3 credential
+    whose remaining cache lifetime is at most
+    ``rgw_keystone_token_cache_refresh_before`` seconds, RGW re-validates that
+    credential against Keystone in the background, reusing the signature it
+    has just verified, and replaces the cached entry. The request itself is
+    served from the cache and never waits for the refresh. At most one refresh
+    is started per cached entry; credentials that are not in the cache are
+    never fetched ahead of time. A refresh that Keystone answers with 404
+    evicts the entry; any other failure leaves it alone until it expires.
+    Requires asynchronous request processing (``rgw_beast_enable_async``, the
+    default); otherwise no refresh is started and the entry expires as usual.
+  default: false
+  services:
+  - rgw
+  see_also:
+  - rgw_keystone_token_cache_refresh_before
+  - rgw_keystone_token_cache_refresh_max_concurrent
+  - rgw_keystone_token_cache_ttl
+  with_legacy: true
+- name: rgw_keystone_token_cache_refresh_before
+  type: uint
+  level: advanced
+  desc: Remaining lifetime (seconds) at which a cached Keystone S3 credential is refreshed
+  long_desc: Only used when ``rgw_keystone_token_cache_refresh_enabled`` is set.
+    Values above half of ``rgw_keystone_token_cache_ttl`` are clamped to that.
+    Also bounds the duration of the background Keystone requests of a refresh.
+  default: 30
+  min: 1
+  services:
+  - rgw
+  see_also:
+  - rgw_keystone_token_cache_refresh_enabled
+  - rgw_keystone_token_cache_ttl
+  with_legacy: true
+- name: rgw_keystone_token_cache_refresh_max_concurrent
+  type: uint
+  level: advanced
+  desc: Maximum number of concurrent background refreshes of Keystone S3 credentials
+  long_desc: Per RGW daemon. When the limit is reached, a credential due for a
+    refresh is left alone; a later request may still start its refresh once a
+    slot is free, otherwise the entry expires as usual.
+  default: 16
+  min: 1
+  services:
+  - rgw
+  see_also:
+  - rgw_keystone_token_cache_refresh_enabled
+  with_legacy: true
 - name: rgw_keystone_verify_ssl
   type: bool
   level: advanced

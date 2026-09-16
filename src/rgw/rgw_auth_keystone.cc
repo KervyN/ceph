@@ -7,7 +7,9 @@
 #include <errno.h>
 #include <fnmatch.h>
 
+#include <boost/asio/spawn.hpp>
 #include <boost/context/detail/exception.hpp>
+#include <boost/context/protected_fixedsize_stack.hpp>
 
 #include "rgw_b64.h"
 
@@ -799,7 +801,16 @@ void SecretCache::erase_locked(std::map<std::string, secret_entry>::iterator ite
   secrets.erase(iter);
 }
 
-SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id)
+uint32_t SecretCache::refresh_before_secs() const
+{
+  const uint64_t configured = cct->_conf->rgw_keystone_token_cache_refresh_before;
+  const uint64_t clamped = std::min<uint64_t>(configured,
+                                              s3_token_expiry_length.sec() / 2);
+  return std::max<uint64_t>(clamped, 1);  // also the background call timeout
+}
+
+SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id,
+                                               const bool want_refresh)
 {
   lookup_result result;
   const utime_t now = now_fn();
@@ -824,14 +835,34 @@ SecretCache::lookup_result SecretCache::lookup(const std::string& access_key_id)
   result.token = entry.token;
   result.secret = entry.secret;
   result.gen = entry.gen;
+
+  if (want_refresh && !entry.refresh_started) {
+    /* the entry dies at the earlier of the cache ttl and the token expiry */
+    const time_t dies = std::min<time_t>(entry.expires.sec(),
+                                         entry.token.get_expires());
+    const time_t remaining = dies - static_cast<time_t>(now.sec());
+    result.near_expiry = remaining <= static_cast<time_t>(refresh_before_secs());
+  }
   return result;
+}
+
+bool SecretCache::erase_if_gen(const std::string& access_key_id,
+                               const uint64_t gen)
+{
+  std::lock_guard<std::mutex> l(lock);
+  auto iter = secrets.find(access_key_id);
+  if (iter == secrets.end() || iter->second.gen != gen) {
+    return false;
+  }
+  erase_locked(iter);
+  return true;
 }
 
 bool SecretCache::find(const std::string& token_id,
                        SecretCache::token_envelope_t& token,
 		       std::string &secret)
 {
-  lookup_result result = lookup(token_id);
+  lookup_result result = lookup(token_id, false);
   if (!result.found) {
     return false;
   }
@@ -844,22 +875,45 @@ void SecretCache::add(const std::string& token_id,
                       const SecretCache::token_envelope_t& token,
 		      const std::string& secret)
 {
+  const utime_t expires = now_fn() + s3_token_expiry_length;
   std::lock_guard<std::mutex> l(lock);
+  add_locked(token_id, token, secret, expires);
+}
 
+bool SecretCache::add_unless_replaced(const std::string& token_id,
+                                      const token_envelope_t& token,
+                                      const std::string& secret,
+                                      const uint64_t gen)
+{
+  const utime_t expires = now_fn() + s3_token_expiry_length;
+  std::lock_guard<std::mutex> l(lock);
+  auto iter = secrets.find(token_id);
+  if (iter != secrets.end() && iter->second.gen != gen) {
+    return false;
+  }
+  add_locked(token_id, token, secret, expires);
+  return true;
+}
+
+void SecretCache::add_locked(const std::string& token_id,
+                             const token_envelope_t& token,
+                             const std::string& secret,
+                             const utime_t expires)
+{
   map<string, secret_entry>::iterator iter = secrets.find(token_id);
   if (iter != secrets.end()) {
     secret_entry& e = iter->second;
     secrets_lru.erase(e.lru_iter);
   }
 
-  const utime_t now = now_fn();
   secrets_lru.push_front(token_id);
   secret_entry& entry = secrets[token_id];
   entry.token = token;
   entry.secret = secret;
-  entry.expires = now + s3_token_expiry_length;
+  entry.expires = expires;
   entry.lru_iter = secrets_lru.begin();
   entry.gen = ++next_gen;
+  entry.refresh_started = false;
 
   while (secrets_lru.size() > max) {
     list<string>::reverse_iterator riter = secrets_lru.rbegin();
@@ -880,6 +934,12 @@ size_t SecretCache::inflight_size()
 {
   std::lock_guard<std::mutex> l(lock);
   return inflight.size();
+}
+
+uint32_t SecretCache::refreshes_in_flight()
+{
+  std::lock_guard<std::mutex> l(lock);
+  return refreshing;
 }
 
 SecretCache::join_result
@@ -938,11 +998,11 @@ SecretCache::Outcome SecretCache::classify(const FetchResult& r) noexcept
   return Outcome::error;
 }
 
-FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
-                                       const SignedSample& sample,
-                                       const fetch_fn& fetch,
-                                       optional_yield y,
-                                       const long timeout_secs)
+FetchResult SecretCache::run_fetch(const DoutPrefixProvider* dpp,
+                                   const SignedSample& sample,
+                                   const fetch_fn& fetch,
+                                   optional_yield y,
+                                   const long timeout_secs)
 {
   FetchResult r;
   try {
@@ -954,7 +1014,16 @@ FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
   } catch (...) {
     r.eptr = std::current_exception();
   }
+  return r;
+}
 
+FetchResult SecretCache::fetch_and_add(const DoutPrefixProvider* dpp,
+                                       const SignedSample& sample,
+                                       const fetch_fn& fetch,
+                                       optional_yield y,
+                                       const long timeout_secs)
+{
+  FetchResult r = run_fetch(dpp, sample, fetch, y, timeout_secs);
   if (r.token && r.secret) {
     /* Add token, secret pair to cache, and set timeout */
     add(sample.access_key_id, *r.token, *r.secret);
@@ -975,9 +1044,12 @@ SecretCache::access_result SecretCache::to_access_result(FetchResult&& r)
 
 std::optional<SecretCache::access_result>
 SecretCache::serve_cached(const DoutPrefixProvider* dpp,
+                          const SignedSample& sample,
                           const lookup_result& cached,
                           verify_fn verify,
-                          const bool ignore_signature)
+                          const bool ignore_signature,
+                          const fetch_fn& fetch,
+                          optional_yield y)
 {
   /* Check that credentials can correctly be used to sign data */
   if (cached.found) {
@@ -990,6 +1062,9 @@ SecretCache::serve_cached(const DoutPrefixProvider* dpp,
     }
     if (verify(cached.secret)) {
       count(l_rgw_keystone_secret_cache_hit);
+      if (cached.near_expiry) {
+        maybe_spawn_refresh(dpp, sample, cached.gen, fetch, y);
+      }
       return access_result{cached.token, cached.secret, 0};
     }
     ldpp_dout(dpp, 0) << "Secret string does not correctly sign payload, cache miss" << dendl;
@@ -1040,11 +1115,15 @@ SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
                           optional_yield y)
 {
   const bool coalesce = cct->_conf->rgw_keystone_token_cache_coalesce_misses;
+  /* an OPTIONS request carries no signature Keystone could re-validate */
+  const bool want_refresh = !ignore_signature &&
+      cct->_conf->rgw_keystone_token_cache_refresh_enabled;
 
   for (int rounds_waited = 0;;) {
     /* Get a token from the cache if one has already been stored */
-    const lookup_result cached = lookup(sample.access_key_id);
-    if (auto served = serve_cached(dpp, cached, verify, ignore_signature)) {
+    const lookup_result cached = lookup(sample.access_key_id, want_refresh);
+    if (auto served = serve_cached(dpp, sample, cached, verify,
+                                   ignore_signature, fetch, y)) {
       return std::move(*served);
     }
 
@@ -1081,6 +1160,224 @@ SecretCache::get_or_fetch(const DoutPrefixProvider* dpp,
       return std::move(*shared);
     }
     ++rounds_waited;
+  }
+}
+
+
+void SecretCache::maybe_spawn_refresh(const DoutPrefixProvider* dpp,
+                                      const SignedSample& sample,
+                                      const uint64_t gen,
+                                      const fetch_fn& fetch,
+                                      optional_yield y)
+{
+  if (!y) {
+    /* no executor to run a coroutine on: give this entry up, once */
+    mark_refresh_started(sample.access_key_id, gen);
+    ldpp_dout(dpp, 20) << "keystone secret cache: no yield context, not "
+                          "refreshing " << sample.access_key_id << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_skipped);
+    return;
+  }
+  if (!arm_refresh(sample.access_key_id, gen)) {
+    return;  // another hit was first, or too many refreshes are running
+  }
+  count(l_rgw_keystone_secret_cache_refresh);
+  try {
+    spawn_refresh(sample, gen, fetch, y);
+  } catch (const std::exception& e) {
+    /* no memory or address space for the coroutine; the request that
+     * asked is authenticated and must not suffer for it */
+    ldpp_dout(dpp, 1) << "keystone secret cache: cannot start a refresh for "
+                      << sample.access_key_id << ": " << e.what() << dendl;
+    release_refresh_slot();
+    count(l_rgw_keystone_secret_cache_refresh_failed);
+    return;
+  }
+  ldpp_dout(dpp, 10) << "keystone secret cache: refreshing "
+                     << sample.access_key_id << " before it expires" << dendl;
+}
+
+bool SecretCache::arm_refresh(const std::string& access_key_id,
+                              const uint64_t gen)
+{
+  const uint64_t max_concurrent =
+      cct->_conf->rgw_keystone_token_cache_refresh_max_concurrent;
+  std::lock_guard<std::mutex> l(lock);
+
+  auto iter = secrets.find(access_key_id);
+  if (iter == secrets.end() || iter->second.gen != gen ||
+      iter->second.refresh_started) {
+    return false;  // gone, replaced, or another hit got here first
+  }
+  if (refreshing >= max_concurrent) {
+    count(l_rgw_keystone_secret_cache_refresh_skipped);
+    return false;  // stays armable: a later hit retries once a slot is free
+  }
+  iter->second.refresh_started = true;
+  ++refreshing;
+  return true;
+}
+
+void SecretCache::mark_refresh_started(const std::string& access_key_id,
+                                       const uint64_t gen)
+{
+  std::lock_guard<std::mutex> l(lock);
+  auto iter = secrets.find(access_key_id);
+  if (iter != secrets.end() && iter->second.gen == gen) {
+    iter->second.refresh_started = true;
+  }
+}
+
+void SecretCache::release_refresh_slot()
+{
+  std::lock_guard<std::mutex> l(lock);
+  ceph_assert(refreshing > 0);
+  --refreshing;
+}
+
+void SecretCache::spawn_refresh(const SignedSample& sample,
+                                const uint64_t gen,
+                                const fetch_fn& fetch,
+                                optional_yield y)
+{
+  /* The request, its dpp and its strings are gone by the time Keystone
+   * answers: the job owns copies of everything it needs. `this` is the
+   * process-lifetime singleton (or a test instance that outlives its
+   * io_context). The coroutine is work on the frontend's io_context, so
+   * shutdown drains it like an in-flight request. */
+  boost::asio::spawn(y.get_yield_context().get_executor(),
+      std::allocator_arg, boost::context::protected_fixedsize_stack{512 * 1024},
+      [this, sample, gen, fetch] (boost::asio::yield_context yield) {
+        run_refresh(sample, gen, fetch, optional_yield{yield});
+      },
+      [cct = cct] (std::exception_ptr eptr) {
+        if (eptr) {
+          ldout(cct.get(), 1) << "keystone secret cache: refresh job "
+                                 "terminated by an exception" << dendl;
+        }
+      });
+}
+
+SecretCache::flight_ptr
+SecretCache::create_refresh_flight(const std::string& access_key_id)
+{
+  std::lock_guard<std::mutex> l(lock);
+  if (inflight.count(access_key_id)) {
+    return nullptr;
+  }
+  auto flight = std::make_shared<Flight>();
+  inflight.emplace(access_key_id, flight);
+  return flight;
+}
+
+void SecretCache::run_refresh(const SignedSample& sample,
+                              const uint64_t gen,
+                              const fetch_fn& fetch,
+                              optional_yield y)
+{
+  struct SlotGuard {
+    SecretCache& cache;
+    ~SlotGuard() { cache.release_refresh_slot(); }
+  } slot{*this};
+
+  const std::string prefix =
+      "keystone secret cache refresh " + sample.access_key_id + ": ";
+  const DoutPrefix dpp(cct.get(), dout_subsys, prefix.c_str());
+  try {
+    const flight_ptr flight = create_refresh_flight(sample.access_key_id);
+    if (!flight) {
+      ldpp_dout(&dpp, 20) << "a request is validating this key right now, "
+                             "skipping" << dendl;
+      count(l_rgw_keystone_secret_cache_refresh_skipped);
+      return;
+    }
+    const FlightGuard guard{*this, sample.access_key_id, flight};
+
+    bool leader = false;
+    bool cached = false;
+    const FetchResult r = call_once(flight->once, y, [&] {
+        leader = true;
+        FetchResult fetched = run_fetch(&dpp, sample, fetch, y,
+                                        refresh_before_secs());
+        if (fetched.token && fetched.secret) {
+          cached = add_unless_replaced(sample.access_key_id, *fetched.token,
+                                       *fetched.secret, gen);
+        }
+        return fetched;
+      });
+
+    if (!leader) {
+      /* a request slipped in first and Keystone judged its sample, not ours */
+      ldpp_dout(&dpp, 20) << "a request validated this key in the meantime, "
+                             "skipping" << dendl;
+      count(l_rgw_keystone_secret_cache_refresh_skipped);
+      return;
+    }
+    finish_refresh(&dpp, sample.access_key_id, gen, r, cached);
+  } catch (const boost::context::detail::forced_unwind&) {
+    throw;  // the coroutine is being destroyed: let it unwind
+  } catch (const std::exception& e) {
+    ldpp_dout(&dpp, 1) << "unexpected exception: " << e.what() << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_failed);
+  } catch (...) {
+    ldpp_dout(&dpp, 1) << "unexpected exception" << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_failed);
+  }
+}
+
+static std::string describe(const FetchResult& r)
+{
+  if (r.eptr) {
+    return "an exception";
+  }
+  if (r.thrown) {
+    return "error " + std::to_string(*r.thrown);
+  }
+  return "keystone reply " + std::to_string(r.failure_reason);
+}
+
+void SecretCache::finish_refresh(const DoutPrefixProvider* dpp,
+                                 const std::string& access_key_id,
+                                 const uint64_t gen,
+                                 const FetchResult& r,
+                                 const bool cached)
+{
+  const Outcome outcome = classify(r);
+  if (outcome == Outcome::success) {
+    if (cached) {
+      ldpp_dout(dpp, 10) << "refreshed" << dendl;
+      count(l_rgw_keystone_secret_cache_refresh_ok);
+    } else {
+      ldpp_dout(dpp, 20) << "a newer credential was cached in the meantime, "
+                            "dropping ours" << dendl;
+      count(l_rgw_keystone_secret_cache_refresh_skipped);
+    }
+    return;
+  }
+
+  const bool deleted = outcome == Outcome::invalid_key ||
+      (outcome == Outcome::token_without_secret &&
+       r.failure_reason == -ERR_INVALID_ACCESS_KEY);
+  if (!deleted) {
+    /* A 401 cannot be told apart from a stale admin token, so it does not
+     * evict either: the credential is served until it expires, as today. */
+    ldpp_dout(dpp, 5) << "failed with " << describe(r)
+                      << ", keeping the cached credential until it expires"
+                      << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_failed);
+    return;
+  }
+
+  /* The credential no longer exists in Keystone: stop serving it, unless
+   * a newer one has been cached in the meantime. */
+  if (erase_if_gen(access_key_id, gen)) {
+    ldpp_dout(dpp, 5) << "credential no longer exists in keystone, evicted it"
+                      << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_evicted);
+  } else {
+    ldpp_dout(dpp, 20) << "credential no longer exists in keystone but was "
+                          "replaced in the meantime" << dendl;
+    count(l_rgw_keystone_secret_cache_refresh_skipped);
   }
 }
 

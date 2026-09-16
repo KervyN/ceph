@@ -288,6 +288,9 @@ class SecretCacheTest : public ::testing::Test {
   void TearDown() override
   {
     set_conf("rgw_keystone_token_cache_coalesce_misses", "false");
+    set_conf("rgw_keystone_token_cache_refresh_enabled", "false");
+    set_conf("rgw_keystone_token_cache_refresh_before", "30");
+    set_conf("rgw_keystone_token_cache_refresh_max_concurrent", "16");
   }
 
   /* the cache snapshots size and ttl in its constructor */
@@ -300,6 +303,39 @@ class SecretCacheTest : public ::testing::Test {
   void enable_coalescing()
   {
     set_conf("rgw_keystone_token_cache_coalesce_misses", "true");
+  }
+
+  void enable_refresh()
+  {
+    set_conf("rgw_keystone_token_cache_refresh_enabled", "true");
+  }
+
+  /* cache "AKID" -> s3cr3t and move the clock into the refresh window
+   * (ttl 300, refresh_before 30: 25 seconds of lifetime left) */
+  void cache_entry_near_expiry(const std::string& akid = "AKID",
+                               const std::string& secret = "s3cr3t")
+  {
+    cache->add(akid, make_token(), secret);
+    advance_clock(275);
+  }
+
+  /* spawn one request on ctx and run it until it completes or suspends */
+  void spawn_request(boost::asio::io_context& ctx, Outcome& out,
+                     Request req, const FakeFetcher& fetcher)
+  {
+    boost::asio::spawn(ctx, [this, &out, &fetcher, req = std::move(req)]
+        (boost::asio::yield_context yield) {
+          out = call(req, fetcher, optional_yield{yield});
+        }, [] (std::exception_ptr eptr) {
+          if (eptr) std::rethrow_exception(eptr);
+        });
+    step(ctx);
+  }
+
+  static void drain(boost::asio::io_context& ctx)
+  {
+    ctx.restart();
+    ctx.run();
   }
 
   static std::vector<Request> requests(size_t n, const Request& req = Request{})
@@ -885,6 +921,385 @@ TEST_F(SecretCacheTest, MissWhileFlightOpenJoinsIt)
   EXPECT_TRUE(second.granted("s3cr3t"));
   EXPECT_EQ(1, fetcher.calls());
   EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_coalesced));
+}
+
+/* ---- asynchronous early refresh ----------------------------------------- */
+
+TEST_F(SecretCacheTest, RefreshIsOffByDefault)
+{
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  const auto outcomes = run_coroutines(requests(5), fetcher);
+  EXPECT_EQ(5u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(0, fetcher.calls());
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+}
+
+TEST_F(SecretCacheTest, RefreshStartsOnceAndNeverBlocksRequests)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) { return ok_result("fresh"); });
+  fetcher.close_gate();
+  const auto outcomes = run_coroutines(requests(100), fetcher, [&] (auto&) {
+      /* every request was answered while the refresh is still parked */
+      EXPECT_EQ(100u, counter(l_rgw_keystone_secret_cache_hit));
+      EXPECT_EQ(1u, fetcher.parked());
+      EXPECT_EQ(1, fetcher.calls());
+      EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+      EXPECT_EQ(1u, cache->refreshes_in_flight());
+      fetcher.open_gate();
+    });
+  EXPECT_EQ(100u, count_granted(outcomes, "s3cr3t"));   // the old secret
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+  EXPECT_EQ(0u, cache->refreshes_in_flight());
+  EXPECT_EQ(0u, cache->inflight_size());
+  auto t = cache->find("AKID");
+  ASSERT_TRUE(t);
+  EXPECT_EQ("fresh", t->get<1>());
+  EXPECT_EQ(std::vector<long>{30}, fetcher.timeouts());  // bounded by refresh_before
+}
+
+TEST_F(SecretCacheTest, RefreshedEntryIsRefreshedAgainInTheNextWindow)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+  advance_clock(200);                 // 75 s into the refreshed entry: not yet
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+  advance_clock(80);                  // 20 s left
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(2u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(2, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, RefreshNotStartedOutsideTheWindow)
+{
+  enable_refresh();
+  cache->add("AKID", make_token(), "s3cr3t");
+  advance_clock(269);                 // 31 s left
+  FakeFetcher fetcher;
+  run_coroutines(requests(3), fetcher);
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+  advance_clock(1);                   // 30 s left: at the threshold
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+}
+
+TEST_F(SecretCacheTest, RefreshBeforeIsClampedToHalfTtl)
+{
+  enable_refresh();
+  set_conf("rgw_keystone_token_cache_refresh_before", "1000");
+  cache->add("AKID", make_token(), "s3cr3t");
+  FakeFetcher fetcher;
+  advance_clock(100);                 // 200 s left > 150
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+  advance_clock(50);                  // 150 s left
+  run_coroutines(requests(1), fetcher);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+}
+
+TEST_F(SecretCacheTest, RefreshWindowUsesKeystoneTokenExpiryWhenEarlier)
+{
+  enable_refresh();
+  /* TokenEnvelope::expired() reads the real clock: align the fake one */
+  fake_now_secs = ::time(nullptr);
+  cache->add("AKID", make_token("u", fake_now_secs + 20), "s3cr3t");
+  FakeFetcher fetcher;
+  run_coroutines(requests(1), fetcher);   // 300 s of cache ttl, 20 s of token
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+}
+
+TEST_F(SecretCacheTest, OptionsHitDoesNotStartRefresh)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  Request req;
+  req.ignore_signature = true;
+  run_coroutines(requests(3, req), fetcher);
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(0, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, MismatchingHitDoesNotStartRefresh)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) {
+      return failed_result(-ERR_SIGNATURE_NO_MATCH); });
+  Request req;
+  req.expected_secret = "wrong";
+  const auto outcomes = run_coroutines(requests(1, req), fetcher);
+  EXPECT_TRUE(outcomes[0].denied(-ERR_SIGNATURE_NO_MATCH));
+  EXPECT_EQ(1, fetcher.calls());       // the request's own lookup
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+}
+
+TEST_F(SecretCacheTest, NullYieldHitSkipsRefreshOncePerEntry)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  EXPECT_TRUE(call(Request{}, fetcher, null_yield).granted("s3cr3t"));
+  EXPECT_TRUE(call(Request{}, fetcher, null_yield).granted("s3cr3t"));
+  EXPECT_EQ(0, fetcher.calls());
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_skipped));
+}
+
+TEST_F(SecretCacheTest, TransientRefreshFailureKeepsEntryAndIsNotRetried)
+{
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) -> FetchResult {
+      if (call_no == 1) throw -ERR_INTERNAL_ERROR;   // 429 at the nginx
+      return ok_result("fresh"); });
+  auto outcomes = run_coroutines(requests(5), fetcher);
+  EXPECT_EQ(5u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_failed));
+  EXPECT_EQ(1u, cache->size());
+  /* more hits inside the window: no second attempt for this entry */
+  outcomes = run_coroutines(requests(5), fetcher);
+  EXPECT_EQ(5u, count_granted(outcomes, "s3cr3t"));
+  EXPECT_EQ(1, fetcher.calls());
+  /* the entry expires as usual and the miss fetches */
+  advance_clock(30);
+  outcomes = run_coroutines(requests(1), fetcher);
+  EXPECT_TRUE(outcomes[0].granted("fresh"));
+  EXPECT_EQ(2, fetcher.calls());
+}
+
+TEST_F(SecretCacheTest, Refresh401KeepsEntryUntilExpiry)
+{
+  /* a 401 also happens when the admin token is stale: evicting on it
+   * would turn an admin token hiccup into a full cache flush */
+  enable_refresh();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) {
+      return failed_result(-ERR_SIGNATURE_NO_MATCH); });
+  const auto outcomes = run_coroutines(requests(1), fetcher);
+  EXPECT_TRUE(outcomes[0].granted("s3cr3t"));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_failed));
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh_evicted));
+  EXPECT_EQ(1u, cache->size());
+  advance_clock(25);
+  EXPECT_TRUE(cache->find("AKID"));
+  advance_clock(1);
+  EXPECT_FALSE(cache->find("AKID"));
+}
+
+TEST_F(SecretCacheTest, RefreshFindingCredentialDeletedEvictsEntry)
+{
+  enable_refresh();
+  for (const FetchResult& rejected : {failed_result(-ERR_INVALID_ACCESS_KEY),
+                                      token_without_secret(-ERR_INVALID_ACCESS_KEY)}) {
+    perfcounter->reset();
+    reset_cache();
+    cache_entry_near_expiry();
+    FakeFetcher fetcher;
+    fetcher.set_script([rejected] (int, const SignedSample&) { return rejected; });
+    const auto outcomes = run_coroutines(requests(1), fetcher);
+    EXPECT_TRUE(outcomes[0].granted("s3cr3t"));   // served before the verdict
+    EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_evicted));
+    EXPECT_EQ(0u, cache->size());
+  }
+}
+
+TEST_F(SecretCacheTest, RefreshVerdictIsDroppedWhenEntryWasReplaced)
+{
+  enable_refresh();
+  cache_entry_near_expiry("AKID", "old");
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) {
+      return call_no == 1 ? failed_result(-ERR_INVALID_ACCESS_KEY) : ok_result("new"); });
+  fetcher.hold_calls([] (int call_no) { return call_no == 1; });
+
+  boost::asio::io_context ctx;
+  Outcome hit, rotated;
+  Request req;
+  req.expected_secret = "old";
+  spawn_request(ctx, hit, req, fetcher);          // starts the refresh (call 1, parked)
+  EXPECT_EQ(1u, cache->refreshes_in_flight());
+  req.expected_secret = "new";
+  spawn_request(ctx, rotated, req, fetcher);      // mismatch: fetches the rotated secret
+  EXPECT_TRUE(rotated.granted("new"));
+  fetcher.open_gate();
+  drain(ctx);
+
+  EXPECT_TRUE(hit.granted("old"));
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh_evicted));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_skipped));
+  auto t = cache->find("AKID");
+  ASSERT_TRUE(t);
+  EXPECT_EQ("new", t->get<1>());                  // the rotated secret survived
+}
+
+TEST_F(SecretCacheTest, RefreshResultIsDroppedWhenEntryWasReplaced)
+{
+  enable_refresh();
+  cache_entry_near_expiry("AKID", "old");
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int call_no, const SignedSample&) {
+      return call_no == 1 ? ok_result("stale") : ok_result("new"); });
+  fetcher.hold_calls([] (int call_no) { return call_no == 1; });
+
+  boost::asio::io_context ctx;
+  Outcome hit, rotated;
+  Request req;
+  req.expected_secret = "old";
+  spawn_request(ctx, hit, req, fetcher);          // starts the refresh (call 1, parked)
+  req.expected_secret = "new";
+  spawn_request(ctx, rotated, req, fetcher);      // mismatch: fetches the rotated secret
+  EXPECT_TRUE(rotated.granted("new"));
+  fetcher.open_gate();
+  drain(ctx);
+
+  EXPECT_EQ(0u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_skipped));
+  auto t = cache->find("AKID");
+  ASSERT_TRUE(t);
+  EXPECT_EQ("new", t->get<1>());                  // not overwritten by the older fetch
+}
+
+TEST_F(SecretCacheTest, MissDuringRefreshJoinsItsFlight)
+{
+  enable_refresh();
+  enable_coalescing();
+  cache_entry_near_expiry();
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) { return ok_result("fresh"); });
+  fetcher.close_gate();
+
+  boost::asio::io_context ctx;
+  Outcome hit;
+  spawn_request(ctx, hit, Request{}, fetcher);    // refresh parked
+  advance_clock(30);                              // the entry expires meanwhile
+  std::vector<Outcome> misses(20);
+  Request req;
+  req.expected_secret = "fresh";
+  for (auto& o : misses) {
+    spawn_request(ctx, o, req, fetcher);          // miss: joins the refresh's flight
+  }
+  EXPECT_EQ(1, fetcher.calls());
+  fetcher.open_gate();
+  drain(ctx);
+
+  EXPECT_TRUE(hit.granted("s3cr3t"));
+  EXPECT_EQ(20u, count_granted(misses, "fresh"));
+  EXPECT_EQ(1, fetcher.calls());
+  EXPECT_EQ(20u, counter(l_rgw_keystone_secret_cache_coalesced));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+}
+
+TEST_F(SecretCacheTest, RefreshSkipsWhenARequestIsValidatingTheKey)
+{
+  enable_refresh();
+  enable_coalescing();
+  cache_entry_near_expiry("AKID", "old");
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) { return ok_result("new"); });
+  fetcher.close_gate();
+
+  boost::asio::io_context ctx;
+  Outcome rotated, hit;
+  Request req;
+  req.expected_secret = "new";
+  spawn_request(ctx, rotated, req, fetcher);      // mismatch: leads a flight, parked
+  req.expected_secret = "old";
+  spawn_request(ctx, hit, req, fetcher);          // verified hit: refresh armed
+  EXPECT_TRUE(hit.granted("old"));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_skipped));
+  EXPECT_EQ(1, fetcher.calls());
+  fetcher.open_gate();
+  drain(ctx);
+  EXPECT_TRUE(rotated.granted("new"));
+  EXPECT_EQ(0u, cache->refreshes_in_flight());
+}
+
+TEST_F(SecretCacheTest, RefreshConcurrencyIsCapped)
+{
+  enable_refresh();
+  set_conf("rgw_keystone_token_cache_refresh_max_concurrent", "1");
+  cache->add("A", make_token(), "sa");
+  cache->add("B", make_token(), "sb");
+  advance_clock(275);                             // both are due
+  FakeFetcher fetcher;
+  fetcher.close_gate();
+
+  boost::asio::io_context ctx;
+  Outcome a, b;
+  spawn_request(ctx, a, Request{make_sample("A"), "sa"}, fetcher);
+  spawn_request(ctx, b, Request{make_sample("B"), "sb"}, fetcher);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_skipped));
+  EXPECT_EQ(1u, cache->refreshes_in_flight());
+  fetcher.open_gate();
+  drain(ctx);
+  EXPECT_EQ(0u, cache->refreshes_in_flight());
+
+  /* B is still due and a later hit starts its refresh */
+  spawn_request(ctx, b, Request{make_sample("B"), "sb"}, fetcher);
+  drain(ctx);
+  EXPECT_EQ(2u, counter(l_rgw_keystone_secret_cache_refresh));
+  EXPECT_EQ(2u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+}
+
+TEST_F(SecretCacheTest, LruEvictionDuringRefreshIsHarmless)
+{
+  set_conf("rgw_keystone_token_cache_size", "1");
+  reset_cache();
+  enable_refresh();
+  cache_entry_near_expiry("A", "sa");
+  FakeFetcher fetcher;
+  fetcher.set_script([] (int, const SignedSample&) { return ok_result("sa2"); });
+  fetcher.close_gate();
+
+  boost::asio::io_context ctx;
+  Outcome a;
+  spawn_request(ctx, a, Request{make_sample("A"), "sa"}, fetcher);
+  cache->add("B", make_token(), "sb");            // evicts A
+  EXPECT_FALSE(cache->find("A"));
+  fetcher.open_gate();
+  drain(ctx);
+  EXPECT_EQ(1u, counter(l_rgw_keystone_secret_cache_refresh_ok));
+  EXPECT_EQ(1u, cache->size());
+  auto t = cache->find("A");
+  ASSERT_TRUE(t);
+  EXPECT_EQ("sa2", t->get<1>());
+}
+
+TEST_F(SecretCacheTest, RefreshFetchExceptionsCountAsFailures)
+{
+  /* both are folded by run_fetch(); run_refresh()'s own handlers are a
+   * last line of defence that nothing reaches in practice */
+  enable_refresh();
+  uint64_t n = 0;
+  for (auto script : {
+      std::function<FetchResult(int, const SignedSample&)>(
+          [] (int, const SignedSample&) -> FetchResult { throw std::logic_error("bug"); }),
+      std::function<FetchResult(int, const SignedSample&)>(
+          [] (int, const SignedSample&) -> FetchResult { throw 42u; })}) {
+    reset_cache();
+    cache_entry_near_expiry();
+    FakeFetcher fetcher;
+    fetcher.set_script(script);
+    const auto outcomes = run_coroutines(requests(1), fetcher);
+    EXPECT_TRUE(outcomes[0].granted("s3cr3t"));
+    EXPECT_EQ(++n, counter(l_rgw_keystone_secret_cache_refresh_failed));
+    EXPECT_EQ(0u, cache->refreshes_in_flight());
+    EXPECT_EQ(1u, cache->size());
+  }
 }
 
 } // anonymous namespace

@@ -29,6 +29,11 @@ enum {
   l_rgw_keystone_secret_cache_hit,
   l_rgw_keystone_secret_cache_miss,
   l_rgw_keystone_secret_cache_coalesced,
+  l_rgw_keystone_secret_cache_refresh,
+  l_rgw_keystone_secret_cache_refresh_ok,
+  l_rgw_keystone_secret_cache_refresh_failed,
+  l_rgw_keystone_secret_cache_refresh_evicted,
+  l_rgw_keystone_secret_cache_refresh_skipped,
 
   l_rgw_gc_retire,
 

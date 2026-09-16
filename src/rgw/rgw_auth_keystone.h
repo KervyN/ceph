@@ -191,6 +191,7 @@ private:
     utime_t expires;
     std::list<std::string>::iterator lru_iter;
     uint64_t gen = 0;  // bumped by every add(): tells a replaced entry apart
+    bool refresh_started = false;  // at most one refresh per generation
   };
 
   struct lookup_result {
@@ -198,6 +199,7 @@ private:
     token_envelope_t token;
     std::string secret;
     uint64_t gen = 0;
+    bool near_expiry = false;  // refresh wanted: expires soon, none started yet
   };
 
   /* One Keystone lookup shared by every request that misses the same
@@ -246,6 +248,7 @@ private:
 
   std::map<std::string, flight_ptr> inflight;  // guarded by `lock`
   uint64_t next_gen = 0;                       // guarded by `lock`
+  uint32_t refreshing = 0;                     // guarded by `lock`
 
   /* A request that waited on someone else's flight and could not use the
    * outcome re-enters at most this often before it contacts Keystone on
@@ -254,8 +257,17 @@ private:
 
   SecretCache() : SecretCache(g_ceph_context) {}
 
-  lookup_result lookup(const std::string& access_key_id);
+  lookup_result lookup(const std::string& access_key_id, bool want_refresh);
   void erase_locked(std::map<std::string, secret_entry>::iterator iter);
+  bool erase_if_gen(const std::string& access_key_id, uint64_t gen);
+  void add_locked(const std::string& token_id, const token_envelope_t& token,
+                  const std::string& secret, utime_t expires);
+  /* add() unless the entry has been replaced since generation gen */
+  bool add_unless_replaced(const std::string& token_id,
+                           const token_envelope_t& token,
+                           const std::string& secret, uint64_t gen);
+  /* rgw_keystone_token_cache_refresh_before, clamped to [1, ttl/2] */
+  uint32_t refresh_before_secs() const;
 
   /* Join the flight for access_key_id, or start one. Checks the cache
    * again first: a caller that finds the key cached since its lookup()
@@ -266,20 +278,47 @@ private:
                         const flight_ptr& flight);
   static Outcome classify(const FetchResult& r) noexcept;
 
+  /* Early refresh: a verified hit close to expiry starts one detached
+   * coroutine on the request's executor that re-validates the request's
+   * sample against Keystone and replaces the entry. The request itself
+   * never waits for it. */
+  void maybe_spawn_refresh(const DoutPrefixProvider* dpp,
+                           const SignedSample& sample, uint64_t gen,
+                           const fetch_fn& fetch, optional_yield y);
+  bool arm_refresh(const std::string& access_key_id, uint64_t gen);
+  void mark_refresh_started(const std::string& access_key_id, uint64_t gen);
+  void release_refresh_slot();
+  void spawn_refresh(const SignedSample& sample, uint64_t gen,
+                     const fetch_fn& fetch, optional_yield y);
+  void run_refresh(const SignedSample& sample, uint64_t gen,
+                   const fetch_fn& fetch, optional_yield y);
+  flight_ptr create_refresh_flight(const std::string& access_key_id);
+  void finish_refresh(const DoutPrefixProvider* dpp,
+                      const std::string& access_key_id, uint64_t gen,
+                      const FetchResult& r, bool cached);
+
   /* The cached credential if the sample verifies against it (or is an
    * OPTIONS request); nullopt means Keystone has to be asked. */
   std::optional<access_result> serve_cached(const DoutPrefixProvider* dpp,
+                                            const SignedSample& sample,
                                             const lookup_result& cached,
                                             verify_fn verify,
-                                            bool ignore_signature);
+                                            bool ignore_signature,
+                                            const fetch_fn& fetch,
+                                            optional_yield y);
   /* What a request that waited for another request's Keystone lookup
    * makes of the outcome; nullopt means it has to look again. */
   std::optional<access_result> use_shared_result(const DoutPrefixProvider* dpp,
                                                  FetchResult&& r,
                                                  verify_fn verify);
 
-  /* Run fetch() and cache a complete result. Folds an int thrown by
-   * fetch() into the result. */
+  /* Run fetch(), folding what it throws into the result. */
+  FetchResult run_fetch(const DoutPrefixProvider* dpp,
+                        const SignedSample& sample,
+                        const fetch_fn& fetch,
+                        optional_yield y,
+                        long timeout_secs);
+  /* run_fetch() and cache a complete result. */
   FetchResult fetch_and_add(const DoutPrefixProvider* dpp,
                             const SignedSample& sample,
                             const fetch_fn& fetch,
@@ -327,6 +366,7 @@ public:
   void set_clock_for_testing(clock_fn now) noexcept { now_fn = now; }
   size_t size();
   size_t inflight_size();
+  uint32_t refreshes_in_flight();
 }; /* class SecretCache */
 
 class EC2Engine : public rgw::auth::s3::AWSEngine {
